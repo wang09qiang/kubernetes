@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -337,6 +338,7 @@ func (rsc *ReplicaSetController) updatePod(old, cur interface{}) {
 		}
 		klog.V(4).Infof("Pod %s updated, objectMeta %+v -> %+v.", curPod.Name, oldPod.ObjectMeta, curPod.ObjectMeta)
 		rsc.enqueueReplicaSet(rs)
+
 		// TODO: MinReadySeconds in the Pod will generate an Available condition to be added in
 		// the Pod status which in turn will trigger a requeue of the owning replica set thus
 		// having its status updated with the newly available replica. For now, we can fake the
@@ -579,7 +581,6 @@ func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
 	if err != nil {
 		return err
 	}
-
 	rsNeedsSync := rsc.expectations.SatisfiedExpectations(key)
 	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
 	if err != nil {
@@ -594,6 +595,21 @@ func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
 	if err != nil {
 		return err
 	}
+
+	// 检查下是不是 inplace cool time
+	for _, condition := range rs.Status.Conditions {
+		if condition.Type == "UpdateInplaceCoolTime" && condition.Status == v1.ConditionTrue {
+			t, _ := strconv.Atoi(condition.Reason)
+			if t == 0 {
+				t = 5
+			}
+			deadLine := condition.LastTransitionTime.Time.Add(time.Duration(t) * time.Second)
+			if deadLine.After(startTime) {
+				rsc.enqueueReplicaSetAfter(rs, deadLine.Sub(startTime)+time.Millisecond)
+				return nil
+			}
+		}
+	}
 	// Ignore inactive pods.
 	filteredPods := controller.FilterActivePods(allPods)
 
@@ -602,6 +618,14 @@ func (rsc *ReplicaSetController) syncReplicaSet(key string) error {
 	filteredPods, err = rsc.claimPods(rs, selector, filteredPods)
 	if err != nil {
 		return err
+	}
+
+	if int32(len(filteredPods)) != *rs.Spec.Replicas {
+		rr, _ := rsc.kubeClient.AppsV1().ReplicaSets(rs.Namespace).Get(rs.Name, metav1.GetOptions{})
+		fmt.Println("\n\n ")
+		for _, p := range filteredPods {
+			fmt.Println(startTime.UnixNano(), len(filteredPods), *rs.Spec.Replicas, rs.Status.AvailableReplicas, rs.Name, "=======", p.Name, rs.Status.Conditions, rr.Status.Conditions)
+		}
 	}
 
 	var manageReplicasErr error
